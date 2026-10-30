@@ -1,5 +1,4 @@
 venv/
-venv312/
 build/
 dist/
 installer_output/

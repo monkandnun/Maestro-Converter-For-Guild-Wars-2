@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Maestro Converter</title>
+<style>
+:root{--bg:#eef1f4;--panel:#fff;--ink:#1c2430;--mute:#5d6878;--line:#d3d9e0;--acc:#2456d6;--acc-ink:#fff;--note:#2456d6;--roll:#f7f9fb}
+@media (prefers-color-scheme:dark){:root{--bg:#141a22;--panel:#1d2530;--ink:#e6ebf1;--mute:#93a0b2;--line:#303b4a;--acc:#6f97ff;--acc-ink:#0d1420;--note:#6f97ff;--roll:#171e28}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 "Segoe UI",system-ui,sans-serif}
+main{max-width:1000px;margin:0 auto;padding:24px 16px 48px;display:grid;gap:16px}
+h1{font-size:1.5rem;margin:0}
+h2{font-size:1rem;margin:0 0 10px}
+p{margin:0;color:var(--mute)}
+section{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}
+#drop{border:2px dashed var(--line);border-radius:8px;padding:28px;text-align:center;cursor:pointer}
+#drop.over,#drop:focus-visible{border-color:var(--acc);outline:none}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
+label{display:grid;gap:4px;font-size:.85rem;color:var(--mute)}
+input,select,textarea{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:7px 9px;width:100%}
+textarea{font:12px/1.4 Consolas,monospace;height:220px;resize:vertical}
+button{font:inherit;border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:6px;padding:7px 14px;cursor:pointer}
+button.primary{background:var(--acc);color:var(--acc-ink);border-color:var(--acc)}
+button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid var(--acc);outline-offset:1px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.tracks label{display:flex;gap:8px;align-items:center;color:var(--ink);font-size:.95rem}
+.tracks input{width:auto}
+#roll{width:100%;height:170px;background:var(--roll);border:1px solid var(--line);border-radius:6px;display:block}
+#msg{color:var(--mute);min-height:1.4em}
+#msg.err{color:#c9362f}
+.hero{border-radius:8px;overflow:hidden;background:#1c2430}
+.hero-img{display:block;width:100%;max-height:380px;object-fit:contain;background:#1c2430}
+.hero-text{padding:14px 20px 18px}
+.hero-text h1,.hero-text p{color:#fff}
+@media (max-width:600px){.hero-img{max-height:260px}}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<main>
+  <div class="hero">
+    <img src="banner.png" alt="" class="hero-img">
+    <div class="hero-text">
+      <h1>Maestro Converter</h1>
+      <p>Turn a MIDI or MusicXML file into a Guild Wars 2 Maestro song. Made by Saber Lily</p>
+    </div>
+  </div>
+
+  <section>
+    <div id="drop" tabindex="0" role="button" aria-label="Choose a file">
+      <strong id="dropText">Drop a .mid, .mxl or .musicxml file here, or click to choose one</strong>
+    </div>
+    <input id="file" type="file" accept=".mid,.midi,.mxl,.musicxml,.xml" hidden>
+  </section>
+
+  <section id="settings" hidden>
+    <h2>Tracks to include</h2>
+    <div id="tracks" class="tracks row" style="margin-bottom:14px"></div>
+    <div class="grid">
+      <label>Title<input id="title"></label>
+      <label>Artist<input id="artist" value="Unknown"></label>
+      <label>Transcriber<input id="transcriber"></label>
+      <label>Instrument
+        <select id="instrument">
+          <option>Piano</option><option>Harp</option><option>Lute</option><option>Bass</option>
+          <option>Flute</option><option>Bell</option><option>BellMagnanimous</option><option>DrumSet</option>
+        </select></label>
+      <label>Transpose (semitones)<input id="transpose" type="number" value="0" step="1"></label>
+      <label>Speed (1 = original)<input id="speed" type="number" value="1" step="0.1" min="0.25" max="4"></label>
+      <label>Max notes per chord<input id="maxChord" type="number" value="4" min="1" max="8"></label>
+      <label>Ignore notes below (60 = middle C)<input id="minPitch" type="number" value="0" min="0" max="108"></label>
+      <label>Style
+        <select id="style"><option value="melody">Melody only</option><option value="bass">Melody + bass</option><option value="full" selected>Full chords</option></select></label>
+      <label>Snap timing to grid
+        <select id="snap"><option value="0">Off</option><option value="4">1/16 note</option><option value="2">1/8 note</option><option value="1">1/4 note</option></select></label>
+      <label>Minimum gap between notes (ms)<input id="minGap" type="number" value="110" min="0" max="500"></label>
+    </div>
+  </section>
+
+  <section id="result" hidden>
+    <h2>Preview</h2>
+    <canvas id="roll"></canvas>
+    <div class="row" style="margin:12px 0">
+      <button id="play" class="primary">Play preview</button>
+      <button id="copy">Copy JSON</button>
+      <button id="download">Download .json</button>
+      <button id="downloadMid">Download simplified .mid</button>
+    </div>
+    <p id="msg" role="status"></p>
+    <label style="margin-top:10px">Maestro JSON<textarea id="out" readonly></textarea></label>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let bpm = 120, file = null, song = null, timer = null, ctx = null, stopTimer = null, playing = [];
+
+/* ---------- upload ---------- */
+$('drop').onclick = () => $('file').click();
+$('drop').onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); $('file').click(); } };
+$('drop').ondragover = e => { e.preventDefault(); $('drop').classList.add('over'); };
+$('drop').ondragleave = () => $('drop').classList.remove('over');
+$('drop').ondrop = e => { e.preventDefault(); $('drop').classList.remove('over'); load(e.dataTransfer.files[0]); };
+$('file').onchange = e => load(e.target.files[0]);
+
+async function load(f) {
+  if (!f) return;
+  file = f;
+  $('dropText').textContent = f.name + ' (click to choose a different file)';
+  $('title').value = f.name.replace(/\.[^.]+$/, '');
+  say('Reading file…');
+  const fd = new FormData(); fd.append('file', f);
+  try {
+    const r = await fetch('/api/inspect', { method: 'POST', body: fd });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.detail);
+    bpm = j.bpm || 120;
+    $('tracks').innerHTML = j.tracks.map((t, i) =>
+      `<label><input type="checkbox" value="${t.index}" ${i < 2 ? 'checked' : ''}> ${esc(t.name)} (${t.notes} notes)</label>`).join('')
+      || '<p>No notes found in this file.</p>';
+    $('tracks').querySelectorAll('input').forEach(c => c.onchange = schedule);
+    $('settings').hidden = false;
+    convert();
+  } catch (e) { $('result').hidden = false; say(e.message, true); }
+}
+const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+/* ---------- convert ---------- */
+['title','artist','transcriber','instrument','transpose','speed','maxChord','minPitch','snap','minGap'].forEach(id => $(id).oninput = schedule);
+function schedule() { clearTimeout(timer); timer = setTimeout(convert, 350); }
+
+function form() {
+  const parts = [...document.querySelectorAll('#tracks input:checked')].map(c => c.value).join(',');
+  const fd = new FormData();
+  fd.append('file', file);
+  if (parts) fd.append('parts', parts);
+  fd.append('title', $('title').value || 'Untitled');
+  fd.append('artist', $('artist').value || 'Unknown');
+  fd.append('transcriber', $('transcriber').value);
+  fd.append('instrument', $('instrument').value);
+  fd.append('transpose', Math.round(+$('transpose').value || 0));
+  fd.append('speed', +$('speed').value || 1);
+  fd.append('max_chord', Math.round(+$('maxChord').value || 4));
+  fd.append('min_pitch', Math.round(+$('minPitch').value || 0));
+  const div = +$('snap').value;                       // notes per beat: 0 = off
+  fd.append('quantize', div ? 60000 / bpm / div : 0);
+  fd.append('min_gap', +$('minGap').value || 0);
+  return fd;
+}
+
+async function convert() {
+  if (!file) return;
+  stop();
+  const fd = form();
+  $('result').hidden = false;
+  say('Converting…');
+  try {
+    const r = await fetch('/api/convert', { method: 'POST', body: fd });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.detail);
+    song = j.song;
+    $('out').value = JSON.stringify(song, null, 2);
+    const s = j.stats;
+    say(`${s.notes} notes became ${song.notes.length} entries. Octave shift: ${s.shift / 12 >= 0 ? '+' : ''}${s.shift / 12}. ` +
+        `${s.folded} notes folded into range` + (s.folded > s.notes * 0.1 ? ' — try picking one hand or a different transpose.' : '.'));
+    draw();
+  } catch (e) { song = null; $('out').value = ''; say(e.message, true); }
+}
+function say(t, err) { $('msg').textContent = t; $('msg').className = err ? 'err' : ''; }
+
+$('style').onchange = () => { $('maxChord').value = { melody: 1, bass: 2, full: 4 }[$('style').value]; schedule(); };
+
+/* ---------- parse entries (same rules as the converter) ---------- */
+const DRUM = { b:48, s:55, x:58, g:53, ht:67, mt:62, ft:57, cr:84, rd:78, hc:72, ho:75, hf:70 };  // preview pitches only
+const SEMI = { C:0, D:2, E:4, F:5, G:7, A:9, B:11 };
+function steps() {
+  let t = 0; const out = [];
+  for (const entry of song.notes) {
+    const toks = entry.split(' ').map(tok => {
+      const [n, ms] = tok.split(':');
+      if (n === 'R') return { rest: true, ms: +ms };
+      const m = n.match(/^([A-G])(#?)([+-]?)(\^?)$/);
+      if (!m) return { midi: DRUM[n] || 60, ms: +ms };
+      const midi = m[4] ? 84 : 60 + SEMI[m[1]] + (m[2] ? 1 : 0) + (m[3] === '+' ? 12 : m[3] === '-' ? -12 : 0);
+      return { midi, ms: +ms };
+    });
+    out.push({ t, toks }); t += toks[0].ms;
+  }
+  return { out, total: t };
+}
+
+/* ---------- piano roll ---------- */
+function draw(playhead) {
+  const c = $('roll'), dpr = devicePixelRatio || 1;
+  c.width = c.clientWidth * dpr; c.height = c.clientHeight * dpr;
+  const g = c.getContext('2d'); g.scale(dpr, dpr);
+  const W = c.clientWidth, H = c.clientHeight;
+  const { out, total } = steps();
+  const css = getComputedStyle(document.documentElement);
+  g.fillStyle = css.getPropertyValue('--note');
+  const rowH = H / 38;
+  for (const s of out) for (const k of s.toks) if (!k.rest) {
+    const x = s.t / total * W, w = Math.max(1.5, k.ms / total * W - 1);
+    g.fillRect(x, H - (k.midi - 47) * rowH, w, Math.max(2, rowH - 1));
+  }
+  if (playhead != null) { g.fillStyle = css.getPropertyValue('--ink'); g.fillRect(playhead / total * W, 0, 2, H); }
+}
+addEventListener('resize', () => song && draw());
+
+/* ---------- playback ---------- */
+$('play').onclick = () => playing.length ? stop() : play();
+function play() {
+  if (!song) return;
+  ctx = ctx || new AudioContext();
+  const { out, total } = steps(), t0 = ctx.currentTime + 0.1;
+  for (const s of out) for (const k of s.toks) if (!k.rest) {
+    const o = ctx.createOscillator(), g = ctx.createGain(), at = t0 + s.t / 1000;
+    o.type = 'triangle'; o.frequency.value = 440 * 2 ** ((k.midi - 69) / 12);
+    g.gain.setValueAtTime(0.0001, at);
+    g.gain.exponentialRampToValueAtTime(0.18, at + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, at + Math.min(1.2, Math.max(0.25, k.ms / 1000)));
+    o.connect(g).connect(ctx.destination); o.start(at); o.stop(at + 1.3);
+    playing.push(o);
+  }
+  $('play').textContent = 'Stop';
+  const tick = () => {
+    const el = (ctx.currentTime - t0) * 1000;
+    if (!playing.length) return;
+    if (el > total + 500) return stop();
+    draw(Math.max(0, el)); stopTimer = requestAnimationFrame(tick);
+  };
+  tick();
+}
+function stop() {
+  playing.forEach(o => { try { o.stop(); } catch {} }); playing = [];
+  cancelAnimationFrame(stopTimer); $('play').textContent = 'Play preview';
+  if (song) draw();
+}
+
+/* ---------- copy / download ---------- */
+$('copy').onclick = async () => {
+  if (!song) return;
+  try { await navigator.clipboard.writeText($('out').value); say('Copied to clipboard.'); }
+  catch { $('out').select(); say('Press Ctrl+C to copy the selected text.'); }
+};
+$('download').onclick = () => {
+  if (!song) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([$('out').value], { type: 'application/json' }));
+  a.download = (song.name || 'song').replace(/[^\w\- ]+/g, '') + '.json';
+  a.click(); URL.revokeObjectURL(a.href);
+};
+$('downloadMid').onclick = async () => {
+  if (!file) return;
+  try {
+    const r = await fetch('/api/midi', { method: 'POST', body: form() });
+    if (!r.ok) throw new Error((await r.json()).detail);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(await r.blob());
+    a.download = (($('title').value || 'song').replace(/[^\w\- ]+/g, '')) + ' (simplified).mid';
+    a.click(); URL.revokeObjectURL(a.href);
+  } catch (e) { say(e.message, true); }
+};
+</script>
+</body>
+</html>

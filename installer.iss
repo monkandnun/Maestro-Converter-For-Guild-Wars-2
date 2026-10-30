@@ -3,9 +3,9 @@
 ; then open it in Inno Setup and press F9.
 
 [Setup]
-AppName=Maestro Converter
-AppVersion=1.0
-DefaultDirName={autopf}\Maestro Converter
+AppName=Maestro ConverterV2
+AppVersion=2.0
+DefaultDirName={autopf}\Maestro ConverterV2
 DefaultGroupName=Maestro Converter
 OutputDir=installer_output
 OutputBaseFilename=MaestroConverter-Setup

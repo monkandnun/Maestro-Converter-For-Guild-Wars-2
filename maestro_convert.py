@@ -22,8 +22,13 @@ RANGES = {
     "Piano": (48, 84), "Harp": (48, 84), "Lute": (48, 84), "Bass": (48, 84),
     "Flute": (48, 84), "Bell": (48, 84),
     "BellMagnanimous": (60, 84),   # 2-octave; ASSUMED to be middle + high
+    "DrumSet": (48, 84),           # placeholder: drums use DRUM_MAP, not pitches
 }
-ENTRY_RE = re.compile(r"^(?:R|[A-G]#?[+-]?\^?):\d+$")
+ENTRY_RE = re.compile(r"^(?:R|[A-G]#?[+-]?\^?|b|s|x|g|ht|mt|ft|cr|rd|hc|ho|hf):\d+$")
+# General-MIDI drum note -> Maestro DrumSet code
+DRUM_MAP = {35: "b", 36: "b", 38: "s", 40: "s", 37: "x", 41: "ft", 43: "ft", 45: "mt",
+            47: "mt", 48: "ht", 50: "ht", 42: "hc", 44: "hf", 46: "ho", 49: "cr",
+            52: "cr", 55: "cr", 57: "cr", 51: "rd", 53: "rd", 59: "rd"}
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +59,7 @@ def read_midi(path):
             break
         length = struct.unpack(">I", data[pos + 4:pos + 8])[0]
         p, end, tick, status = pos + 8, pos + 8 + length, 0, 0
-        name, notes, open_notes = "", [], {}
+        name, notes, drums, open_notes = "", [], [], {}
         while p < end:
             delta, p = _vlq(data, p)
             tick += delta
@@ -82,21 +87,20 @@ def read_midi(path):
             d1, d2 = data[p], data[p + 1]
             p += 2
             if kind == 0x9 and d2 > 0:
-                if ch != 9:                                  # skip GM drums
-                    open_notes.setdefault((ch, d1), []).append(tick)
+                open_notes.setdefault((ch, d1), []).append(tick)
             elif kind == 0x8 or (kind == 0x9 and d2 == 0):
                 starts = open_notes.get((ch, d1))
                 if starts:
-                    notes.append((starts.pop(0), tick, d1))
+                    (drums if ch == 9 else notes).append((starts.pop(0), tick, d1))
         for (ch, pitch), starts in open_notes.items():       # unterminated notes
             for s in starts:
-                notes.append((s, tick, pitch))
-        tracks.append({"name": name, "notes": sorted(notes)})
+                (drums if ch == 9 else notes).append((s, tick, pitch))
+        tracks.append({"name": name, "notes": sorted(notes), "drums": sorted(drums)})
         pos = end
     return division, tempos, tracks
 
 
-def midi_to_events(path, track_ids=None, speed=1.0):
+def midi_to_events(path, track_ids=None, speed=1.0, drums=False):
     """-> list of (start_ms, end_ms, pitch), tempo changes applied."""
     tpb, tempos, tracks = read_midi(path)
     tempos = sorted(tempos, key=lambda t: t[0])              # stable: later wins at same tick
@@ -114,7 +118,7 @@ def midi_to_events(path, track_ids=None, speed=1.0):
     for i, tr in enumerate(tracks):
         if track_ids is not None and i not in track_ids:
             continue
-        events += [(to_ms(s), to_ms(e), p) for s, e, p in tr["notes"]]
+        events += [(to_ms(s), to_ms(e), p) for s, e, p in tr["drums" if drums else "notes"]]
     return events
 
 
@@ -218,11 +222,20 @@ def thin_chord(pitches, max_chord):
     return sorted(keep)
 
 
-def build_entries(events, instrument="Piano", transpose=0, auto_shift=True,
-                  chord_window=30, max_chord=4, rests=True, rest_min=150,
-                  min_ms=60, tail_ms=500):
+def thin_group(g, max_chord):
+    by_pitch = {}
+    for s, e, p in g:
+        if p not in by_pitch or e > by_pitch[p][1]:
+            by_pitch[p] = (s, e, p)
+    return [by_pitch[p] for p in thin_chord(list(by_pitch), max_chord)]
+
+
+def prepare_groups(events, instrument="Piano", transpose=0, auto_shift=True,
+                   chord_window=30, max_chord=4, min_pitch=0, quantize=0, min_gap=0):
+    """Filter, transpose, fit to range and group into chords.
+    Returns (groups, stats); each group is a list of (start_ms, end_ms, pitch)."""
     lo, hi = RANGES[instrument]
-    events = [(s, e, p + transpose) for s, e, p in events]
+    events = [(s, e, p + transpose) for s, e, p in events if p >= min_pitch]
     stats = {"notes": len(events), "shift": 0, "folded": 0}
     if not events:
         return [], stats
@@ -235,6 +248,10 @@ def build_entries(events, instrument="Piano", transpose=0, auto_shift=True,
         q = fold(p, lo, hi)
         stats["folded"] += q != p
         folded.append((s, e, q))
+    if quantize:                                      # snap starts/ends to a grid
+        folded = [(round(s / quantize) * quantize,
+                   max(round(e / quantize) * quantize, round(s / quantize) * quantize + quantize), p)
+                  for s, e, p in folded]
     folded.sort()
 
     # group onsets that start within chord_window of each other
@@ -245,6 +262,58 @@ def build_entries(events, instrument="Piano", transpose=0, auto_shift=True,
         else:
             groups.append(cur); cur = [ev]
     groups.append(cur)
+    groups = [thin_group(g, max_chord) for g in groups]
+    if min_gap:                                       # drop onsets too close to the last kept one
+        kept = []
+        for g in groups:
+            if kept and g[0][0] - kept[-1][0][0] < min_gap:
+                continue
+            kept.append(g)
+        stats["thinned"] = len(groups) - len(kept)
+        groups = kept
+    return groups, stats
+
+
+def _enc_vlq(n):
+    out = [n & 0x7F]
+    n >>= 7
+    while n:
+        out.append((n & 0x7F) | 0x80)
+        n >>= 7
+    return bytes(reversed(out))
+
+
+def write_midi(path, groups, tpb=480, tempo=500000):
+    """Write the simplified groups as a single-track Standard MIDI File."""
+    k = tpb * 1e6 / tempo / 1000.0                    # ticks per millisecond
+    ev = []
+    for g in groups:
+        on = round(g[0][0] * k)
+        for _, e, p in g:
+            ev.append((on, 1, p))
+            ev.append((max(round(e * k), on + round(50 * k)), 0, p))
+    ev.sort()                                         # note-offs sort before note-ons
+    trk = bytearray(b"\x00\xff\x51\x03" + tempo.to_bytes(3, "big") + b"\x00\xc0\x00")
+    last = 0
+    for tick, kind, p in ev:
+        trk += _enc_vlq(tick - last)
+        trk += bytes([0x90 if kind else 0x80, p, 90 if kind else 0])
+        last = tick
+    trk += b"\x00\xff\x2f\x00"
+    with open(path, "wb") as f:
+        f.write(b"MThd" + (6).to_bytes(4, "big") + (0).to_bytes(2, "big")
+                + (1).to_bytes(2, "big") + tpb.to_bytes(2, "big"))
+        f.write(b"MTrk" + len(trk).to_bytes(4, "big") + bytes(trk))
+
+
+def build_entries(events, instrument="Piano", transpose=0, auto_shift=True,
+                  chord_window=30, max_chord=4, rests=True, rest_min=150,
+                  min_ms=60, tail_ms=500, min_pitch=0, quantize=0, min_gap=0):
+    lo, hi = RANGES[instrument]
+    groups, stats = prepare_groups(events, instrument, transpose, auto_shift,
+                                   chord_window, max_chord, min_pitch, quantize, min_gap)
+    if not groups:
+        return [], stats
 
     entries, t0 = [], round(groups[0][0][0])
     if rests and t0 >= rest_min:
@@ -253,7 +322,7 @@ def build_entries(events, instrument="Piano", transpose=0, auto_shift=True,
     for gi, g in enumerate(groups):
         on = g[0][0]
         max_end = max(max_end, max(e for _, e, _ in g))
-        pitches = thin_chord([p for _, _, p in g], max_chord)
+        pitches = [p for _, _, p in g]
         if gi + 1 < len(groups):
             nxt = groups[gi + 1][0][0]
             gap = nxt - on
@@ -268,6 +337,35 @@ def build_entries(events, instrument="Piano", transpose=0, auto_shift=True,
         entries.append(" ".join(fmt_note(p, dur, lo, hi) for p in pitches))
         if rest >= 1:
             entries.append(f"R:{round(rest)}")
+    return entries, stats
+
+
+def build_drum_entries(events, chord_window=30, quantize=0, min_gap=110, tail_ms=250):
+    """events: (start_ms, end_ms, midi_drum_note) -> Maestro DrumSet entries."""
+    hits = [((round(s / quantize) * quantize if quantize else s), DRUM_MAP[p])
+            for s, _, p in events if p in DRUM_MAP]
+    stats = {"notes": len(hits), "shift": 0, "folded": 0}
+    if not hits:
+        return [], stats
+    hits.sort()
+    groups, cur = [], [hits[0]]
+    for h in hits[1:]:
+        if h[0] - cur[0][0] <= chord_window:
+            cur.append(h)
+        else:
+            groups.append(cur); cur = [h]
+    groups.append(cur)
+    kept = []
+    for g in groups:
+        if kept and g[0][0] - kept[-1][0][0] < min_gap:
+            continue
+        kept.append(g)
+    entries, t0 = [], round(kept[0][0][0])
+    if t0 >= 150:
+        entries.append(f"R:{t0}")
+    for i, g in enumerate(kept):
+        dur = round(kept[i + 1][0][0] - g[0][0]) if i + 1 < len(kept) else tail_ms
+        entries.append(" ".join(f"{c}:{max(dur, 1)}" for c in sorted({c for _, c in g})))
     return entries, stats
 
 
@@ -298,6 +396,15 @@ def main():
     ap.add_argument("--speed", type=float, default=1.0, help="2.0 = twice as fast")
     ap.add_argument("--max-chord", type=int, default=4, help="max notes per chord (0 = no limit)")
     ap.add_argument("--chord-window", type=float, default=30, help="ms; onsets this close = one chord")
+    ap.add_argument("--min-pitch", type=int, default=0,
+                    help="drop notes below this MIDI pitch (60 = middle C; roughly keeps the right hand)")
+    ap.add_argument("--style", choices=["full", "melody", "melody-bass"], default="full",
+                    help="melody = top note only; melody-bass = top + bottom note; full = --max-chord")
+    ap.add_argument("--quantize", type=float, default=0,
+                    help="snap timing to a grid in ms (60000 / BPM / 4 = sixteenth notes; 0 = off)")
+    ap.add_argument("--min-gap", type=float, default=110,
+                    help="ms; drop notes that start closer than this to the previous one (0 = off)")
+    ap.add_argument("--midi-out", help="also write the simplified result as a .mid file")
     ap.add_argument("--no-rests", action="store_true", help="never insert R: entries inside the song")
     ap.add_argument("--rest-min", type=float, default=150, help="ms of silence before a rest is inserted")
     ap.add_argument("--no-repeats", action="store_true", help="MusicXML: don't expand repeats")
@@ -313,9 +420,13 @@ def main():
         (list_midi if is_midi else list_musicxml)(a.input)
         return
 
+    a.max_chord = {"melody": 1, "melody-bass": 2}.get(a.style, a.max_chord)
+    drums = a.instrument == "DrumSet"
+    if drums and not is_midi:
+        sys.exit("DrumSet conversion needs a .mid file")
     ids, tmp = parse_ids(a.parts), None
     if is_midi:
-        events = midi_to_events(a.input, ids, a.speed)
+        events = midi_to_events(a.input, ids, a.speed, drums)
     else:
         tmp = musicxml_to_midi(a.input, ids, not a.no_repeats)
         try:
@@ -323,10 +434,20 @@ def main():
         finally:
             os.remove(tmp)
 
-    entries, st = build_entries(
-        events, a.instrument, a.transpose, not a.no_auto_shift, a.chord_window,
-        a.max_chord, not a.no_rests, a.rest_min)
+    if drums:
+        entries, st = build_drum_entries(events, a.chord_window, a.quantize, a.min_gap)
+    else:
+        entries, st = build_entries(
+            events, a.instrument, a.transpose, not a.no_auto_shift, a.chord_window,
+            a.max_chord, not a.no_rests, a.rest_min, min_pitch=a.min_pitch,
+            quantize=a.quantize, min_gap=a.min_gap)
     validate(entries)
+    if a.midi_out and not drums:
+        groups, _ = prepare_groups(events, a.instrument, a.transpose, not a.no_auto_shift,
+                                   a.chord_window, a.max_chord, a.min_pitch,
+                                   a.quantize, a.min_gap)
+        write_midi(a.midi_out, groups)
+        print(f"wrote {a.midi_out}", file=sys.stderr)
 
     song = {"name": a.title or os.path.splitext(os.path.basename(a.input))[0],
             "artist": a.artist, "transcriber": a.transcriber,
@@ -335,7 +456,7 @@ def main():
     out = json.dumps(song, indent=2)
     if a.output:
         open(a.output, "w").write(out)
-    else:
+    elif not a.midi_out:
         print(out)
     print(f"{st['notes']} notes -> {len(entries)} entries | octave shift {st['shift']:+d} semitones | "
           f"{st['folded']} notes folded into range", file=sys.stderr)
